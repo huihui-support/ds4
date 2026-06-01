@@ -30,11 +30,70 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/un.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+
+/* ====================== Unix Domain Socket ====================== */
+bool ds4_is_localhost(const char *host) {
+    if (!host) return false;
+    return strcmp(host, "127.0.0.1") == 0 ||
+           strcmp(host, "localhost") == 0 ||
+           strcmp(host, "::1") == 0 ||
+           strcmp(host, "0.0.0.0") == 0;
+}
+
+static void ds4_uds_make_path(char *buf, size_t buflen, int port) {
+    snprintf(buf, buflen, "/tmp/ds4_uds_%d.sock", port);
+}
+
+int ds4_create_uds_listener(const char *path, char *err, size_t errlen) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        if (errlen) snprintf(err, errlen, "UDS socket: %s", strerror(errno));
+        return -1;
+    }
+
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path)-1);
+
+    unlink(path);
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        if (errlen) snprintf(err, errlen, "UDS bind %s: %s", path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 64) < 0) {
+        if (errlen) snprintf(err, errlen, "UDS listen: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+int ds4_connect_uds(const char *path, char *err, size_t errlen) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        if (errlen) snprintf(err, errlen, "UDS socket: %s", strerror(errno));
+        return -1;
+    }
+
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path)-1);
+
+    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        if (errlen) snprintf(err, errlen, "UDS connect %s: %s", path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
 
 /* =========================================================================
  * Protocol Constants And Wire Records
@@ -1151,6 +1210,12 @@ static void dist_peer_name(int fd, char *host, size_t hostlen, char *port, size_
 }
 
 static int dist_open_listener(const char *host, int port, char *err, size_t errlen) {
+    if (ds4_is_localhost(host)) {
+        char path[256];
+        ds4_uds_make_path(path, sizeof(path), port);
+        return ds4_create_uds_listener(path, err, errlen);
+    }
+
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
     const char *host_display = host ? host : "*";
@@ -1219,6 +1284,13 @@ static bool dist_connect_errno_retryable(int e) {
 }
 
 static int dist_connect_endpoint_once(const char *host, int port, int *last_errno, char *err, size_t errlen) {
+    if (ds4_is_localhost(host)) {
+        char path[256];
+        ds4_uds_make_path(path, sizeof(path), port);
+        return ds4_connect_uds(path, err, errlen);
+    }
+
+
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
     if (last_errno) *last_errno = 0;

@@ -122,4 +122,8 @@ int ds4_dist_session_load_payload(
  */
 int ds4_dist_run(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist_generation_options *gen);
 
+/* ====================== UDS ====================== */
+bool ds4_is_localhost(const char *host);
+int ds4_create_uds_listener(const char *path, char *err, size_t errlen);
+int ds4_connect_uds(const char *path, char *err, size_t errlen);
 #endif
