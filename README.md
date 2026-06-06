@@ -7,26 +7,30 @@
 **Purpose**: Dramatically speed up multi-GPU layer-splitting inference on a single machine using a single process, with full support for consumer-grade graphics cards.
 
 ## How to Use
-```bash
 
 ### ds4, RTX 4090 (24G) * 6
+```bash
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
 ./ds4 \
   --cuda \
   -m gguf/ds4flash.gguf \
   --tensor-parallel 6 \
   --ctx 262144
+```
 
 ### ds4, RTX 6000 Pro (96G) * 2
+```bash
 export CUDA_VISIBLE_DEVICES=0,1
 ./ds4 \
   --cuda \
   -m gguf/ds4flash.gguf \
   --tensor-parallel 2 \
   --ctx 524288
+```
 
 
 ### ds4_server, RTX 6000 Pro (96G) * 2
+```bash
 export CUDA_VISIBLE_DEVICES=0,1
 ./ds4-server \
   --cuda \
