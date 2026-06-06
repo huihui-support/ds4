@@ -7,8 +7,6 @@
 **Purpose**: Dramatically speed up multi-GPU layer-splitting inference on a single machine using a single process, with full support for consumer-grade graphics cards.
 
 #### How to Use
-No extra flags needed — **it activates automatically**:
-
 ```bash
 
 # Worker (on the same machine)
