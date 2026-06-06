@@ -167,6 +167,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
         opt(fp, c, "--warm-weights", "Touch mapped tensor pages at startup to reduce first-use stalls.");
+        opt(fp, c, "--tensor-parallel N", "Split transformer layers across N GPUs on one machine. Layers are distributed evenly among devices. Example: 4 GPUs split 43 layers as 10+11+11+11.");
     }
     fputc('\n', fp);
 }

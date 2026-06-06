@@ -1485,6 +1485,12 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--tensor-parallel")) {
+            c.engine.n_tensor_parallel = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (c.engine.n_tensor_parallel < 1 || c.engine.n_tensor_parallel > 8) {
+                fprintf(stderr, "ds4: --tensor-parallel must be between 1 and 8\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logits")) {

@@ -11490,6 +11490,12 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--tensor-parallel")) {
+            c.engine.n_tensor_parallel = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.engine.n_tensor_parallel < 1 || c.engine.n_tensor_parallel > 8) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: --tensor-parallel must be between 1 and 8");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu")) {

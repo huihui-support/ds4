@@ -105,6 +105,7 @@ typedef struct {
     uint32_t load_layer_end;
     bool load_output;
     ds4_distributed_options distributed;
+    int n_tensor_parallel;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);

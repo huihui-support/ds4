@@ -1792,9 +1792,6 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
                                             uint32_t span_count) {
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
-    if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
-        return true;
-    }
 
     const double t0 = now_sec();
     uint64_t prepared = 0;
@@ -10120,7 +10117,9 @@ static bool metal_graph_alloc_raw_cap(
         uint32_t                raw_cap,
         uint32_t                ctx_size,
         uint32_t                prefill_cap,
-        bool                    enable_mtp) {
+        bool                    enable_mtp,
+        uint32_t                layer_start,
+        uint32_t                layer_end) {
     memset(g, 0, sizeof(*g));
     g->mtp_enabled = enable_mtp;
     if (raw_cap == 0) raw_cap = 1;
@@ -10136,7 +10135,9 @@ static bool metal_graph_alloc_raw_cap(
     g->raw_window = raw_window;
     g->prefill_cap = prefill_cap;
     uint32_t min_ratio = UINT32_MAX;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    uint32_t lstart = layer_start < DS4_N_LAYER ? layer_start : 0;
+    uint32_t lend = layer_end < DS4_N_LAYER ? layer_end : DS4_N_LAYER - 1;
+    for (uint32_t il = lstart; il <= lend; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio != 0 && ratio < min_ratio) min_ratio = ratio;
     }
@@ -10177,14 +10178,6 @@ static bool metal_graph_alloc_raw_cap(
     const bool managed_kv_cache =
         ds4_gpu_should_use_managed_kv_cache(kv_cache_bytes, context_bytes) != 0;
     if (managed_kv_cache) {
-        /*
-         * CUDA device allocations are fastest, but a million-token KV cache is
-         * large enough to starve DGX Spark's unified CPU/GPU memory once the
-         * model cache and driver allocations are present.  For this one
-         * long-lived cache class, managed memory restores the old demand-paged
-         * behavior.  It can be slower, but it keeps oversized contexts from
-         * turning memory pressure into a machine-wide lockup.
-         */
         fprintf(stderr,
                 "ds4: CUDA using managed KV cache for ctx=%u "
                 "(kv cache %.2f GiB, context buffers %.2f GiB); "
@@ -10213,7 +10206,7 @@ static bool metal_graph_alloc_raw_cap(
     g->kv_raw = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     g->kv = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     bool state_init_ok = true;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = lstart; il <= lend; il++) {
         g->layer_raw_cache[il] = metal_graph_alloc_kv_cache_tensor(
                 managed_kv_cache,
                 (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float));
@@ -10369,7 +10362,7 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_routed_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
 
     bool layer_cache_ok = true;
-    for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
+    for (uint32_t il = lstart; layer_cache_ok && il <= lend; il++) {
         layer_cache_ok = g->layer_raw_cache[il] != NULL;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (layer_cache_ok && ratio != 0) {
@@ -10444,7 +10437,8 @@ static bool metal_graph_alloc(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer) {
-    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false);
+    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false,
+                                     0, DS4_N_LAYER - 1);
 }
 
 static uint32_t metal_graph_raw_span_for_batch(
@@ -15193,6 +15187,7 @@ static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
+        if (!g->layer_attn_state_kv[il]) continue;
         const uint32_t coff = ratio == 4 ? 2u : 1u;
         const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
         const uint64_t attn_rows = (uint64_t)coff * ratio;
@@ -16050,7 +16045,8 @@ static int metal_graph_prompt_logits_test(
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false);
+                                        raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false,
+                                        0, DS4_N_LAYER - 1);
     if (!ok) {
         metal_graph_free(&g);
         fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
@@ -16360,6 +16356,7 @@ struct ds4_engine {
     int power_percent;
     bool quality;
     ds4_distributed_options distributed;
+    int n_tensor_parallel;
     bool metal_ready;
     bool mtp_ready;
 };
@@ -17482,7 +17479,8 @@ static int generate_metal_graph_raw_swa(
     }
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false,
+                                        0, DS4_N_LAYER - 1);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate GPU graph runtime\n");
         return 1;
@@ -17720,9 +17718,27 @@ static void ds4_acquire_instance_lock(void) {
     atexit(ds4_release_instance_lock);
 }
 
+/* Multi-GPU (tensor parallel) session.  Each GPU owns a contiguous range of
+ * transformer layers.  The main session (GPU 0) handles layer 0..N and the
+ * output head; sub-sessions on GPUs 1..M-1 handle intermediate ranges.  HC
+ * (hidden-context) activations are transferred between GPUs through a host-side
+ * bounce buffer. */
+#define DS4_TP_MAX_GPUS 8
+
+typedef struct {
+    int n_gpus;
+    uint32_t layer_start[DS4_TP_MAX_GPUS];
+    uint32_t layer_end[DS4_TP_MAX_GPUS];
+    ds4_session *sub_sessions[DS4_TP_MAX_GPUS];
+    float *hc_bounce;
+    uint64_t hc_bounce_bytes;
+    bool initialized;
+} ds4_multi_gpu_session;
+
 struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
+    ds4_multi_gpu_session *multi;
 #ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
 #endif
@@ -18088,12 +18104,30 @@ static bool ds4_layer_payload_range_valid(uint32_t layer_start, uint32_t layer_e
     return layer_start <= layer_end && layer_end < (uint32_t)DS4_N_LAYER;
 }
 
+/* Find the sub-session that owns the given layer range for multi-GPU.
+ * Returns NULL if the range spans multiple sub-sessions. */
+static ds4_session *ds4_multi_gpu_sub_session_for_layers(
+        ds4_multi_gpu_session *m, uint32_t layer_start, uint32_t layer_end) {
+    if (!m) return NULL;
+    for (int g = 0; g < m->n_gpus; g++) {
+        if (layer_start >= m->layer_start[g] && layer_end <= m->layer_end[g]) {
+            return m->sub_sessions[g];
+        }
+    }
+    return NULL;
+}
+
 uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
                                          uint32_t layer_start,
                                          uint32_t layer_end) {
     if (!s || !s->checkpoint_valid ||
         !ds4_layer_payload_range_valid(layer_start, layer_end))
         return 0;
+    if (s->multi) {
+        ds4_session *sub = ds4_multi_gpu_sub_session_for_layers(s->multi, layer_start, layer_end);
+        if (sub) return ds4_session_layer_payload_bytes(sub, layer_start, layer_end);
+        return 0;
+    }
     if (ds4_session_is_cpu(s)) return 0;
 #ifdef DS4_NO_GPU
     (void)layer_start;
@@ -18129,6 +18163,12 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
     if (!s || !fp || !s->checkpoint_valid ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload save");
+        return 1;
+    }
+    if (s->multi) {
+        ds4_session *sub = ds4_multi_gpu_sub_session_for_layers(s->multi, layer_start, layer_end);
+        if (sub) return ds4_session_save_layer_payload(sub, fp, layer_start, layer_end, err, errlen);
+        payload_set_err(err, errlen, "layer range spans multiple GPUs");
         return 1;
     }
     if (ds4_session_is_cpu(s)) {
@@ -18265,6 +18305,13 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
     if (!s || !fp || !tokens ||
         !ds4_layer_payload_range_valid(layer_start, layer_end)) {
         payload_set_err(err, errlen, "invalid session layer payload load");
+        return 1;
+    }
+    if (s->multi) {
+        ds4_session *sub = ds4_multi_gpu_sub_session_for_layers(s->multi, layer_start, layer_end);
+        if (sub) return ds4_session_load_layer_payload(sub, fp, payload_bytes, tokens, n_tokens,
+                                                        layer_start, layer_end, err, errlen);
+        payload_set_err(err, errlen, "layer range spans multiple GPUs");
         return 1;
     }
     if (ds4_session_is_cpu(s)) {
@@ -18737,6 +18784,11 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
     }
+    if (s->multi) {
+        /* For multi-GPU, save from GPU 0's sub-session (first layer range).
+         * Full multi-GPU payload save/load is not yet implemented. */
+        return ds4_session_save_payload(s->multi->sub_sessions[0], fp, err, errlen);
+    }
     if (s->distributed) {
         return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
     }
@@ -18945,6 +18997,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
+    }
+    if (s->multi) {
+        return ds4_session_load_payload(s->multi->sub_sessions[0], fp, payload_bytes, err, errlen);
     }
     if (s->distributed) {
         return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
@@ -19484,9 +19539,10 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
-                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false,
+                                        0, DS4_N_LAYER - 1);
     if (!ok) {
-        fprintf(stderr, "ds4: failed to allocate imatrix Metal graph runtime\n");
+        fprintf(stderr, "ds4: failed to initialize imatrix Metal graph runtime\n");
         free(dataset);
         return 1;
     }
@@ -19918,6 +19974,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->backend = opt->backend;
     e->quality = opt->quality;
     e->distributed = opt->distributed;
+    e->n_tensor_parallel = opt->n_tensor_parallel > 0 ? opt->n_tensor_parallel : 1;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     if (e->power_percent > 100) e->power_percent = 100;
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
@@ -19937,7 +19994,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
     }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
-    //ds4_acquire_instance_lock();
+    ds4_acquire_instance_lock();
 
     bool load_slice = opt->load_slice;
     uint32_t load_layer_start = opt->load_layer_start;
@@ -20004,13 +20061,21 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 #endif
     }
     if (graph_backend) {
-        e->metal_ready = ds4_gpu_init() != 0;
+        int n_init_gpus = e->n_tensor_parallel > 1 ? e->n_tensor_parallel : 1;
+        e->metal_ready = n_init_gpus > 1 ? ds4_gpu_init_n(n_init_gpus) : ds4_gpu_init();
         if (!e->metal_ready) {
             fprintf(stderr, "ds4: %s backend unavailable; aborting startup\n",
                     ds4_backend_name(e->backend));
             ds4_engine_close(e);
             *out = NULL;
             return 1;
+        }
+        /* Multi-GPU: use DS4_CUDA_DIRECT_MODEL so uncached ranges fall back to
+         * HMM direct host access.  Per-GPU weight caching in
+         * ds4_multi_gpu_session_create then copies each GPU's layer range into
+         * device memory via cudaMalloc+cudaMemcpy for fast HBM access. */
+        if (e->n_tensor_parallel > 1) {
+            setenv("DS4_CUDA_DIRECT_MODEL", "1", 0);
         }
         ds4_gpu_set_quality(e->quality);
         (void)ds4_gpu_set_model_fd(e->model.fd);
@@ -20115,21 +20180,35 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        if (!accelerator_cache_model_tensors(e->backend, &e->model,
-                                             load_offsets, load_sizes,
-                                             load_span_count)) {
-            fprintf(stderr, "ds4: %s failed to prepare optional model cache\n",
-                    ds4_backend_name(e->backend));
-            free(load_offsets);
-            free(load_sizes);
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
+        /* Multi-GPU (tensor parallel) caches model weights per-GPU in
+         * ds4_multi_gpu_session_create; skip the single-device cache here. */
+        if (e->n_tensor_parallel <= 1) {
+            if (!accelerator_cache_model_tensors(e->backend, &e->model,
+                                                 load_offsets, load_sizes,
+                                                 load_span_count)) {
+                fprintf(stderr, "ds4: %s failed to prepare optional model cache\n",
+                        ds4_backend_name(e->backend));
+                free(load_offsets);
+                free(load_sizes);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            /* Also apply explicit optional Q8 preload settings to the MTP support
+             * model when loaded. */
+            if (e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->mtp_model,
+                                                                 NULL, NULL, 0)) {
+                fprintf(stderr, "ds4: %s failed to prepare optional MTP model cache\n",
+                        ds4_backend_name(e->backend));
+                free(load_offsets);
+                free(load_sizes);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
         }
         free(load_offsets);
         free(load_sizes);
-        /* Also apply explicit optional Q8 preload settings to the MTP support
-         * model when loaded. */
         if (e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->mtp_model,
                                                              NULL, NULL, 0)) {
             fprintf(stderr, "ds4: %s failed to prepare optional MTP model cache\n",
@@ -20215,6 +20294,334 @@ void ds4_engine_close(ds4_engine *e) {
     free(e);
 }
 
+/* =========================================================================
+ * Multi-GPU (Tensor Parallel) Orchestrator
+ * =========================================================================
+ *
+ * Splits transformer layers across N GPUs on a single machine.  Each GPU
+ * owns a contiguous layer range and keeps its own KV-cache shard and scratch
+ * tensors on its device.  Hidden-state (HC) activations are transferred
+ * between GPUs through a host-side bounce buffer.
+ *
+ * Layer assignment: GPU 0 gets 10 layers, GPUs 1..N-1 get 11 each (for 43
+ * total).  The last GPU also computes the output head.
+ * ========================================================================= */
+
+static void ds4_tp_layer_ranges(int n_gpus, uint32_t total_layers,
+                                 uint32_t *layer_start, uint32_t *layer_end) {
+    if (n_gpus < 1) n_gpus = 1;
+    int remaining = (int)total_layers;
+    for (int g = 0; g < n_gpus; g++) {
+        int layers_this_gpu;
+        if (g == 0) {
+            /* GPU 0 gets fewer layers so others have balanced work */
+            layers_this_gpu = (remaining + n_gpus - 1) / n_gpus - 1;
+            if (layers_this_gpu < 1) layers_this_gpu = 1;
+        } else {
+            int remaining_gpus = n_gpus - g;
+            layers_this_gpu = (remaining + remaining_gpus - 1) / remaining_gpus;
+        }
+        if (layers_this_gpu > remaining) layers_this_gpu = remaining;
+        layer_start[g] = (g == 0) ? 0 : layer_end[g - 1] + 1;
+        layer_end[g] = layer_start[g] + (uint32_t)layers_this_gpu - 1;
+        remaining -= layers_this_gpu;
+    }
+}
+
+static int ds4_multi_gpu_session_create(
+        ds4_multi_gpu_session *m, ds4_engine *e, int ctx_size, int n_gpus,
+        char *err, size_t errlen) {
+    memset(m, 0, sizeof(*m));
+    m->n_gpus = n_gpus;
+
+    ds4_tp_layer_ranges(n_gpus, DS4_N_LAYER, m->layer_start, m->layer_end);
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t hc_bytes = hc_dim * sizeof(float);
+
+    /* Allocate host bounce buffer for HC transfer (max prefill chunk).  The
+     * sync function processes prompts in prefill_cap-sized chunks. */
+    uint32_t prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
+    m->hc_bounce_bytes = (uint64_t)prefill_cap * hc_bytes;
+    m->hc_bounce = (float *)xmalloc((size_t)m->hc_bounce_bytes);
+
+    /* Register model weights on all devices so CUDA kernels on any GPU can
+     * access the model mapping via UVA.  Device 0 was already registered in
+     * ds4_engine_open; register on remaining devices now. */
+    for (int rg = 1; rg < n_gpus; rg++) {
+        ds4_gpu_register_model_on_device(rg, e->model.map, e->model.size);
+    }
+
+    int g = 0;
+    for (g = 0; g < n_gpus; g++) {
+        /* Switch to this GPU device */
+        ds4_gpu_set_device(g);
+
+        ds4_session *sub = xcalloc(1, sizeof(*sub));
+        sub->engine = e;
+        sub->ctx_size = ctx_size;
+        sub->prefill_cap = prefill_cap;
+        const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
+        const ds4_layer_weights *shape_layer = weights_first_bound_layer(&e->weights);
+        if (!shape_layer) {
+            if (errlen) snprintf(err, errlen, "no transformer layers loaded");
+            goto fail;
+        }
+
+        /* Only allocate KV caches for this GPU's layer range */
+        if (!metal_graph_alloc_raw_cap(&sub->graph, &e->weights, shape_layer,
+                                       raw_cap, (uint32_t)ctx_size, prefill_cap,
+                                       (g == 0 && e->mtp_ready),
+                                       m->layer_start[g], m->layer_end[g])) {
+            if (errlen) snprintf(err, errlen, "failed to allocate GPU %d graph", g);
+            goto fail;
+        }
+        sub->graph.quality = e->quality;
+        sub->graph.power_percent = (uint32_t)e->power_percent;
+
+        if (g == 0) {
+            /* GPU 0 also loads directional steering */
+            if (!metal_graph_load_directional_steering(&sub->graph,
+                                                       e->directional_steering_file,
+                                                       e->directional_steering_attn_scale,
+                                                       e->directional_steering_ffn_scale)) {
+                if (errlen) snprintf(err, errlen, "failed to load directional steering on GPU 0");
+                goto fail;
+            }
+        }
+
+        /* Cache model weight tensor spans for this GPU's layer range.
+         * GPU 0 automatically gets token embeddings (handled by weights_model_map_spans
+         * when layer_start == 0); the last GPU gets the output head. */
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+        if (e->backend == DS4_BACKEND_CUDA) {
+            const bool need_output = (g == n_gpus - 1);
+            ds4_model_map_span_vec spans;
+            if (weights_model_map_spans(&e->weights,
+                                        m->layer_start[g],
+                                        m->layer_end[g],
+                                        need_output,
+                                        &spans))
+            {
+                const uint32_t n_spans = spans.len;
+                uint64_t *cache_offsets = xmalloc((size_t)n_spans * sizeof(cache_offsets[0]));
+                uint64_t *cache_sizes = xmalloc((size_t)n_spans * sizeof(cache_sizes[0]));
+                for (uint32_t si = 0; si < n_spans; si++) {
+                    cache_offsets[si] = spans.v[si].off;
+                    cache_sizes[si] = spans.v[si].end - spans.v[si].off;
+                }
+                free(spans.v);
+                uint64_t prepared = 0;
+                if (!accelerator_prepare_model_tensor_spans(&e->model,
+                                                             cache_offsets, cache_sizes,
+                                                             n_spans, &prepared)) {
+                    free(cache_offsets);
+                    free(cache_sizes);
+                    if (errlen) snprintf(err, errlen, "failed to cache model tensor spans on GPU %d", g);
+                    goto fail;
+                }
+                if (!accelerator_cache_q8_tensors(&e->model,
+                                                   cache_offsets, cache_sizes,
+                                                   n_spans)) {
+                    free(cache_offsets);
+                    free(cache_sizes);
+                    if (errlen) snprintf(err, errlen, "failed to cache Q8 tensors on GPU %d", g);
+                    goto fail;
+                }
+                free(cache_offsets);
+                free(cache_sizes);
+                fprintf(stderr, "ds4: GPU %d cached %.2f GiB of model tensor spans (layers %u..%u%s)\n",
+                        g,
+                        (double)prepared / 1073741824.0,
+                        m->layer_start[g],
+                        m->layer_end[g],
+                        need_output ? "+output" : "");
+            }
+            /* Cache MTP model on GPU 0 */
+            if (g == 0 && e->mtp_ready) {
+                if (!accelerator_cache_model_tensors(e->backend, &e->mtp_model,
+                                                     NULL, NULL, 0)) {
+                    if (errlen) snprintf(err, errlen, "failed to cache MTP model on GPU 0");
+                    goto fail;
+                }
+            }
+        }
+#endif
+
+        sub->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(sub->logits[0]));
+        if (g == 0 && e->mtp_ready) {
+            sub->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(sub->mtp_logits[0]));
+            sub->mtp_draft_token = -1;
+        }
+        m->sub_sessions[g] = sub;
+    }
+
+    /* Switch back to device 0 */
+    ds4_gpu_set_device(0);
+    m->initialized = true;
+    return 0;
+
+fail:
+    for (int i = 0; i < g; i++) {
+        if (m->sub_sessions[i]) {
+            ds4_session_free(m->sub_sessions[i]);
+            m->sub_sessions[i] = NULL;
+        }
+    }
+    free(m->hc_bounce);
+    m->hc_bounce = NULL;
+    ds4_gpu_set_device(0);
+    return 1;
+}
+
+static void ds4_multi_gpu_session_free(ds4_multi_gpu_session *m) {
+    if (!m || !m->initialized) return;
+    for (int g = 0; g < m->n_gpus; g++) {
+        if (m->sub_sessions[g]) {
+            ds4_session_free(m->sub_sessions[g]);
+            m->sub_sessions[g] = NULL;
+        }
+    }
+    free(m->hc_bounce);
+    m->hc_bounce = NULL;
+    m->initialized = false;
+}
+
+/* Sync (prefill) across all GPUs.  Token embeddings are computed on GPU 0,
+ * then HC is forwarded through each GPU in sequence.  The last GPU computes
+ * logits.  The prompt is processed in prefill_cap-sized chunks. */
+static int ds4_multi_gpu_session_sync(
+        ds4_multi_gpu_session *m, ds4_session *owner,
+        const ds4_tokens *prompt, float *logits,
+        char *err, size_t errlen) {
+    (void)owner;
+    if (!m || !m->initialized) {
+        if (errlen) snprintf(err, errlen, "multi-GPU session is not initialized");
+        return 1;
+    }
+
+    const int n_gpus = m->n_gpus;
+    float *hc_bounce = m->hc_bounce;
+    uint32_t n_tokens = (uint32_t)prompt->len;
+    uint32_t prefill_cap = m->sub_sessions[0]->prefill_cap;
+
+    /* Reset graph prefill state, but preserve checkpoint (global KV position) */
+    for (int g = 0; g < n_gpus; g++) {
+        ds4_gpu_set_device(g);
+        if (!metal_graph_reset_prefill_state(&m->sub_sessions[g]->graph)) {
+            if (errlen) snprintf(err, errlen, "failed to reset GPU %d prefill state", g);
+            return 1;
+        }
+        m->sub_sessions[g]->graph.mtp_n_raw = 0;
+    }
+    ds4_gpu_set_device(0);
+
+    /* Global KV position = owner checkpoint length (tokens from previous turns) */
+    const uint32_t global_pos0 = (uint32_t)owner->checkpoint.len;
+
+    /* Process prompt in prefill_cap-sized chunks */
+    uint32_t pos0 = 0;
+    while (pos0 < n_tokens) {
+        uint32_t chunk = n_tokens - pos0;
+        if (chunk > prefill_cap) chunk = prefill_cap;
+        const uint32_t kv_pos = global_pos0 + pos0;
+
+        /* GPU 0: embed tokens and compute first layer range */
+        ds4_gpu_set_device(0);
+        int rc = ds4_session_eval_layer_slice(m->sub_sessions[0],
+                                              prompt->v + pos0, chunk, kv_pos,
+                                              m->layer_start[0], m->layer_end[0],
+                                              NULL,  /* input_hc = NULL (embed from tokens) */
+                                              (n_gpus > 1) ? hc_bounce : NULL,  /* output_hc */
+                                              false,  /* no logits yet */
+                                              NULL,
+                                              err, errlen);
+        if (rc != 0) return rc;
+
+        /* Intermediate GPUs: forward HC through each layer range */
+        for (int g = 1; g < n_gpus; g++) {
+            ds4_gpu_set_device(g);
+            ds4_session *sub = m->sub_sessions[g];
+            bool is_last = (g == n_gpus - 1);
+            bool last_chunk = (pos0 + chunk >= n_tokens);
+
+            rc = ds4_session_eval_layer_slice(sub,
+                                              prompt->v + pos0, chunk, kv_pos,
+                                              m->layer_start[g], m->layer_end[g],
+                                              hc_bounce,  /* input_hc from previous GPU */
+                                              is_last ? NULL : hc_bounce,  /* output_hc */
+                                              is_last && last_chunk,  /* output_logits only on last chunk */
+                                              (is_last && last_chunk) ? logits : NULL,
+                                              err, errlen);
+            if (rc != 0) return rc;
+        }
+
+        pos0 += chunk;
+    }
+
+    /* Append prompt tokens to owner checkpoint so decode knows the KV position */
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        token_vec_push(&owner->checkpoint, prompt->v[i]);
+    }
+    owner->checkpoint_valid = true;
+    owner->mtp_draft_valid = false;
+
+    /* Switch back to device 0 */
+    ds4_gpu_set_device(0);
+    return 0;
+}
+
+/* Decode one token across all GPUs.  Token embedding on GPU 0, then forward
+ * HC through each GPU.  Last GPU computes logits. */
+static int ds4_multi_gpu_session_eval(
+        ds4_multi_gpu_session *m, ds4_session *owner,
+        int token, uint32_t pos0, float *logits,
+        char *err, size_t errlen) {
+    (void)owner;
+    if (!m || !m->initialized) {
+        if (errlen) snprintf(err, errlen, "multi-GPU session is not initialized");
+        return 1;
+    }
+
+    const int n_gpus = m->n_gpus;
+    float *hc_bounce = m->hc_bounce;
+    int tokens_arr[1] = {token};
+
+    ds4_session *s0 = m->sub_sessions[0];
+
+    /* GPU 0: embed token and compute first layer range */
+    ds4_gpu_set_device(0);
+    int rc = ds4_session_eval_layer_slice(s0,
+                                          tokens_arr, 1, pos0,
+                                          m->layer_start[0], m->layer_end[0],
+                                          NULL,  /* input_hc = NULL (embed from token) */
+                                          (n_gpus > 1) ? hc_bounce : NULL,  /* output_hc */
+                                          n_gpus == 1,  /* output_logits */
+                                          (n_gpus == 1) ? logits : NULL,
+                                          err, errlen);
+    if (rc != 0) return rc;
+
+    /* Intermediate GPUs: forward HC */
+    for (int g = 1; g < n_gpus; g++) {
+        ds4_gpu_set_device(g);
+        ds4_session *sub = m->sub_sessions[g];
+        bool is_last = (g == n_gpus - 1);
+
+        rc = ds4_session_eval_layer_slice(sub,
+                                          tokens_arr, 1, pos0,
+                                          m->layer_start[g], m->layer_end[g],
+                                          hc_bounce,
+                                          is_last ? NULL : hc_bounce,
+                                          is_last,
+                                          is_last ? logits : NULL,
+                                          err, errlen);
+        if (rc != 0) return rc;
+    }
+
+    ds4_gpu_set_device(0);
+    return 0;
+}
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
@@ -20248,44 +20655,65 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         free(s);
         return 1;
     }
-    if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
-                                   raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready))
-    {
-        free(s);
-        return 1;
-    }
-    s->graph.quality = e->quality;
-    s->graph.power_percent = (uint32_t)e->power_percent;
-    if (!metal_graph_load_directional_steering(&s->graph,
-                                               e->directional_steering_file,
-                                               e->directional_steering_attn_scale,
-                                               e->directional_steering_ffn_scale)) {
-        metal_graph_free(&s->graph);
-        free(s);
-        return 1;
-    }
-    s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-    if (e->mtp_ready) {
-        s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
-        s->mtp_draft_token = -1;
-    }
-    if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
-        char err[256];
-        if (ds4_dist_session_create(&s->distributed,
-                                    e,
-                                    &e->distributed,
-                                    s,
-                                    ctx_size,
-                                    err,
-                                    sizeof(err)) != 0) {
-            fprintf(stderr,
-                    "ds4: failed to create distributed coordinator session: %s\n",
-                    err[0] ? err : "unknown error");
-            metal_graph_free(&s->graph);
-            free(s->logits);
-            free(s->mtp_logits);
+    if (e->n_tensor_parallel > 1) {
+        /* Multi-GPU mode: create sub-sessions for each GPU */
+        char tp_err[256];
+        s->multi = xcalloc(1, sizeof(*s->multi));
+        if (ds4_multi_gpu_session_create(s->multi, e, ctx_size,
+                                          e->n_tensor_parallel,
+                                          tp_err, sizeof(tp_err)) != 0) {
+            fprintf(stderr, "ds4: failed to create multi-GPU session: %s\n",
+                    tp_err[0] ? tp_err : "unknown error");
+            free(s->multi);
             free(s);
             return 1;
+        }
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        if (e->mtp_ready) {
+            s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
+            s->mtp_draft_token = -1;
+        }
+    } else {
+        if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, shape_layer,
+                                       raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready,
+                                       0, DS4_N_LAYER - 1))
+        {
+            free(s);
+            return 1;
+        }
+        s->graph.quality = e->quality;
+        s->graph.power_percent = (uint32_t)e->power_percent;
+        if (!metal_graph_load_directional_steering(&s->graph,
+                                                   e->directional_steering_file,
+                                                   e->directional_steering_attn_scale,
+                                                   e->directional_steering_ffn_scale)) {
+            metal_graph_free(&s->graph);
+            free(s);
+            return 1;
+        }
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        if (e->mtp_ready) {
+            s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
+            s->mtp_draft_token = -1;
+        }
+        if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR) {
+            char err[256];
+            if (ds4_dist_session_create(&s->distributed,
+                                        e,
+                                        &e->distributed,
+                                        s,
+                                        ctx_size,
+                                        err,
+                                        sizeof(err)) != 0) {
+                fprintf(stderr,
+                        "ds4: failed to create distributed coordinator session: %s\n",
+                        err[0] ? err : "unknown error");
+                metal_graph_free(&s->graph);
+                free(s->logits);
+                free(s->mtp_logits);
+                free(s);
+                return 1;
+            }
         }
     }
     *out = s;
@@ -20296,6 +20724,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
     ds4_dist_session_free(s->distributed);
+    ds4_multi_gpu_session_free(s->multi);
+    free(s->multi);
+    s->multi = NULL;
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
         cpu_decode_scratch_free(&s->cpu_scratch);
@@ -20332,7 +20763,13 @@ int ds4_session_set_power(ds4_session *s, int power_percent) {
     if (!s || !s->engine || power_percent < 1 || power_percent > 100) return 1;
     s->engine->power_percent = power_percent;
 #ifndef DS4_NO_GPU
-    if (!ds4_session_is_cpu(s)) s->graph.power_percent = (uint32_t)power_percent;
+    if (s->multi) {
+        for (int g = 0; g < s->multi->n_gpus; g++) {
+            s->multi->sub_sessions[g]->graph.power_percent = (uint32_t)power_percent;
+        }
+    } else if (!ds4_session_is_cpu(s)) {
+        s->graph.power_percent = (uint32_t)power_percent;
+    }
 #endif
     return 0;
 }
@@ -20360,6 +20797,19 @@ int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
         return 1;
     }
     ds4_session_invalidate(s);
+    if (s->multi) {
+        for (int g = 0; g < s->multi->n_gpus; g++) {
+            ds4_gpu_set_device(g);
+            if (!metal_graph_reset_prefill_state(&s->multi->sub_sessions[g]->graph)) {
+                if (errlen) snprintf(err, errlen, "%s layer-slice state reset failed on GPU %d",
+                                     ds4_backend_name(s->engine->backend), g);
+                return 1;
+            }
+            s->multi->sub_sessions[g]->graph.mtp_n_raw = 0;
+        }
+        ds4_gpu_set_device(0);
+        return 0;
+    }
     if (ds4_session_is_cpu(s)) {
         session_cpu_reset_cache(s);
         return 0;
@@ -20734,11 +21184,12 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
     if (!ok) {
+        int fail_dev = ds4_gpu_get_device();
         if (ds4_gpu_synchronize() == 0) {
             fprintf(stderr, "ds4: synchronize after layer-slice failure also failed\n");
         }
-        if (errlen) snprintf(err, errlen, "%s layer-slice failed",
-                             ds4_backend_name(e->backend));
+        if (errlen) snprintf(err, errlen, "%s layer-slice failed (GPU %d)",
+                             ds4_backend_name(e->backend), fail_dev);
         s->checkpoint_valid = false;
         return 1;
     }
@@ -20788,6 +21239,9 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
         snprintf(err, errlen, "prompt exceeds context");
         return 1;
+    }
+    if (s->multi) {
+        return ds4_multi_gpu_session_sync(s->multi, s, prompt, s->logits, err, errlen);
     }
     if (s->distributed) {
         const ds4_tokens *checkpoint = s->checkpoint_valid ? &s->checkpoint : NULL;
@@ -21113,6 +21567,16 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
+    if (s->multi) {
+        uint32_t pos0 = s->checkpoint_valid ? (uint32_t)s->checkpoint.len : 0;
+        int rc = ds4_multi_gpu_session_eval(s->multi, s, token, pos0, s->logits, err, errlen);
+        if (rc == 0) {
+            token_vec_push(&s->checkpoint, token);
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+        }
+        return rc;
+    }
     if (s->distributed) {
         if (!s->checkpoint_valid) {
             if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");
@@ -21217,6 +21681,12 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
+    if (s->multi) {
+        if (!accepted) return 0;
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
     if (s->distributed) {
         if (!accepted) return 0;
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
@@ -21824,6 +22294,14 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
+    if (s->multi) {
+        /* Rewind all sub-sessions */
+        for (int g = 0; g < s->multi->n_gpus; g++) {
+            ds4_gpu_set_device(g);
+            ds4_session_rewind(s->multi->sub_sessions[g], pos);
+        }
+        ds4_gpu_set_device(0);
+    }
 }
 
 int ds4_session_pos(ds4_session *s) {

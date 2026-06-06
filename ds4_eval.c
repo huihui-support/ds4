@@ -1212,6 +1212,7 @@ typedef struct {
     int soft_limit_think_close_rank;
     ds4_think_mode think_mode;
     ds4_dist_options dist;
+    int tensor_parallel;
     bool plain;
     bool warm_weights;
     bool quality;
@@ -1563,6 +1564,12 @@ static eval_config parse_options(int argc, char **argv) {
             c.backend = DS4_BACKEND_METAL;
         } else if (!strcmp(arg, "--cuda")) {
             c.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--tensor-parallel")) {
+            c.tensor_parallel = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.tensor_parallel < 1 || c.tensor_parallel > 8) {
+                fprintf(stderr, "ds4-eval: --tensor-parallel must be between 1 and 8\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--cpu")) {
             c.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--quality")) {
@@ -3856,6 +3863,7 @@ int main(int argc, char **argv) {
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
         .distributed = cfg.dist,
+        .n_tensor_parallel = cfg.tensor_parallel > 0 ? cfg.tensor_parallel : 1,
     };
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
