@@ -72,6 +72,13 @@ typedef struct {
 #define DS4_MAX_GPUS 8
 static int g_n_gpus = 1;
 static int g_current_device = 0;
+/* Per-thread last device set via ds4_gpu_set_device().  The global
+ * g_current_device is shared across threads (main thread sets it during
+ * engine/session init, worker thread reads it later).  Without a per-thread
+ * copy the early-return in ds4_gpu_set_device(dev) fires when dev matches
+ * the main-thread value, so the worker thread never calls cudaSetDevice()
+ * and has no CUDA context for the target device. */
+static __thread int g_thread_device = -1;
 
 static const void *g_model_host_base;
 static const char *g_model_device_base;
@@ -1432,11 +1439,12 @@ extern "C" int ds4_gpu_device_count(void) {
 
 extern "C" int ds4_gpu_set_device(int dev) {
     if (dev < 0 || dev >= g_n_gpus) return 0;
-    if (dev == g_current_device) return 1;
+    if (dev == g_thread_device) return 1;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
     /* Clear any pending CUDA errors from previous device operations */
     (void)cudaGetLastError();
     g_current_device = dev;
+    g_thread_device = dev;
     g_cublas = g_cublas_per_device[dev];
     g_cublas_ready = g_cublas_ready_per_device[dev];
     return 1;
