@@ -1,4 +1,4 @@
-### ds4 Tensor-Parallel Acceleration Patch
+# ds4 Tensor-Parallel Acceleration Patch
 
 **Version**: ds4 + Tensor-Parallel Patch v1.0  
 **Forked from**: antirez/ds4  
@@ -6,11 +6,10 @@
 **Date**: June 6, 2026  
 **Purpose**: Dramatically speed up multi-GPU layer-splitting inference on a single machine using a single process, with full support for consumer-grade graphics cards.
 
-#### How to Use
+## How to Use
 ```bash
 
-# Worker (on the same machine)
-# RTX 4090 (24G) * 6
+### ds4, RTX 4090 (24G) * 6
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
 ./ds4 \
   --cuda \
@@ -18,7 +17,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
   --tensor-parallel 6 \
   --ctx 262144
 
-# RTX 6000 Pro (96G) * 2
+### ds4, RTX 6000 Pro (96G) * 2
 export CUDA_VISIBLE_DEVICES=0,1
 ./ds4 \
   --cuda \
@@ -26,6 +25,18 @@ export CUDA_VISIBLE_DEVICES=0,1
   --tensor-parallel 2 \
   --ctx 524288
 
+
+### ds4_server, RTX 6000 Pro (96G) * 2
+export CUDA_VISIBLE_DEVICES=0,1
+./ds4-server \
+  --cuda \
+  -m gguf/Huihui-DeepSeek-V4-Flash-BF16-abliterated-ds4-Q4_K.gguf \
+  --tensor-parallel 2 \
+  --ctx 524288 \
+  --kv-disk-dir ./ds4-kv-cache \
+  --kv-disk-space-mb 32768 \
+  --power 75 \
+  --host 0.0.0.0
 
 ```
 
